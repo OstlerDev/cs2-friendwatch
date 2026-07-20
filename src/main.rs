@@ -1,3 +1,6 @@
+// Windows GUI subsystem: no console window when launched (incl. release).
+#![windows_subsystem = "windows"]
+
 mod audio;
 mod bootstrap;
 mod config;
