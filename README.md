@@ -19,29 +19,21 @@ That’s the whole install. No installer, no extra DLLs next to the exe.
 
 ## How to use
 
-1. Start **Steam**, then start **Friendwatch**.
-   - Tip: start Friendwatch *before* CS2 if you want map/score info in the list.
-2. You’ll see friends who are currently in CS2. Click the ones you want to watch.
+1. Start **Steam**, **CS2**, then start **FriendWatch**.
+2. You’ll see friends who are currently in CS2. Click the ones you want to watch for an open spot.
 3. Hit **Start watching**.
 4. When a spot opens you’ll get:
    - a CS2-style **YOUR MATCH IS READY!** popup
    - an alert sound
    - a desktop notification
 5. Click **ACCEPT** (or the green **Join** on their row) to join through Steam — same idea as clicking Join Game yourself.
-6. After you join, watching stops. Hit **Start watching** again if you want another spot.
 
 Open **⚙** in the corner for volume, custom sound, and how often it checks.
 
-## What “joinable” means
-
-Friendwatch only alerts when Steam actually offers a join path (the same signal as Join Game in your friends list).
-
-If a friend is mid-Premier / mid-match and Steam still hides Join Game, Friendwatch won’t treat them as joinable either — even if their party looks like it has empty seats.
-
-## Tips
+## Notes
 
 - Someone else can still grab the spot first. It’s a race.
-- Some friends’ privacy / party settings hide join info. Nothing Friendwatch can do about that.
+- Some friends’ privacy / party settings hide join info. Nothing FriendWatch can do about that.
 - Your watch list and settings are saved automatically.
 
 ## Build from source (optional)
