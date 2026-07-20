@@ -22,6 +22,9 @@ pub struct Config {
     /// Idle friend-list refresh interval in seconds (`5.0..=60.0`).
     #[serde(default = "default_idle_poll")]
     pub idle_poll_secs: f32,
+    /// Exit FriendWatch after clicking ACCEPT on the match-ready popup.
+    #[serde(default)]
+    pub close_after_accept: bool,
 }
 
 fn default_volume() -> f32 {
@@ -45,6 +48,7 @@ impl Default for Config {
             show_rp_debug: false,
             active_poll_secs: default_active_poll(),
             idle_poll_secs: default_idle_poll(),
+            close_after_accept: true,
         }
     }
 }
@@ -84,5 +88,28 @@ impl Config {
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(&path, json).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_after_accept_defaults_false_when_missing() {
+        let cfg: Config = serde_json::from_str(r#"{"sound_volume":0.5, "close_after_accept": false}"#).unwrap();
+        assert!(!cfg.close_after_accept);
+        assert!((cfg.sound_volume - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn close_after_accept_round_trips() {
+        let cfg = Config {
+            close_after_accept: true,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert!(loaded.close_after_accept);
     }
 }

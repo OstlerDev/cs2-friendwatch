@@ -92,6 +92,7 @@ struct FriendwatchApp {
     sound_volume: f32,
     custom_sound_path: Option<String>,
     show_rp_debug: bool,
+    close_after_accept: bool,
     active_poll_secs: f32,
     idle_poll_secs: f32,
     alert_player: AlertPlayer,
@@ -129,6 +130,7 @@ impl FriendwatchApp {
         let sound_volume = config.sound_volume;
         let custom_sound_path = config.custom_sound_path.clone();
         let show_rp_debug = config.show_rp_debug;
+        let close_after_accept = config.close_after_accept;
         let active_poll_secs = config.active_poll_secs;
         let idle_poll_secs = config.idle_poll_secs;
         let alert_player = AlertPlayer::new(sound_volume);
@@ -171,6 +173,7 @@ impl FriendwatchApp {
             sound_volume,
             custom_sound_path,
             show_rp_debug,
+            close_after_accept,
             active_poll_secs,
             idle_poll_secs,
             alert_player,
@@ -183,6 +186,7 @@ impl FriendwatchApp {
             sound_volume: self.sound_volume,
             custom_sound_path: self.custom_sound_path.clone(),
             show_rp_debug: self.show_rp_debug,
+            close_after_accept: self.close_after_accept,
             active_poll_secs: self.active_poll_secs,
             idle_poll_secs: self.idle_poll_secs,
         };
@@ -418,17 +422,22 @@ impl FriendwatchApp {
         );
     }
 
-    fn do_join(&mut self) {
+    /// Returns `true` when the app should exit (successful accept + setting enabled).
+    fn do_join(&mut self) -> bool {
         let Some(p) = self.pending.take() else {
-            return;
+            return false;
         };
         self.alert_armed = false;
         self.stop_join_alert();
         match open_join(&p.method, p.steam_id) {
-            Ok(()) => self.stop_watching_after_join(&p.name),
+            Ok(()) => {
+                self.stop_watching_after_join(&p.name);
+                self.close_after_accept
+            }
             Err(e) => {
                 self.status_msg = e;
                 self.pending = Some(p);
+                false
             }
         }
     }
@@ -577,6 +586,22 @@ impl FriendwatchApp {
             }
             ui.label(
                 RichText::new("Friend list refresh when not actively watching.")
+                    .color(MUTED)
+                    .size(11.0),
+            );
+
+            ui.add_space(8.0);
+            if ui
+                .checkbox(
+                    &mut self.close_after_accept,
+                    "Close after accept-match",
+                )
+                .changed()
+            {
+                persist = true;
+            }
+            ui.label(
+                RichText::new("Exit FriendWatch after you click ACCEPT on the match-ready popup.")
                     .color(MUTED)
                     .size(11.0),
             );
@@ -810,7 +835,9 @@ impl eframe::App for FriendwatchApp {
             }
         }
         if join_clicked {
-            self.do_join();
+            if self.do_join() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         } else if dismiss_clicked {
             self.dismiss_pending();
         }
