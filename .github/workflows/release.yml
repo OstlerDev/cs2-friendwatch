@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build & attach Windows exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Stage exe
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/cs2-friendwatch.exe \
+            "dist/cs2-friendwatch-${GITHUB_REF_NAME}-windows-x64.exe"
+
+      - name: Attach exe to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/cs2-friendwatch-*-windows-x64.exe
