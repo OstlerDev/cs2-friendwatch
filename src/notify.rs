@@ -11,7 +11,6 @@ pub fn open_join(method: &JoinMethod, friend_steam_id: u64) -> Result<(), String
             let uri = join_connect_uri(connect);
             open::that(&uri).map_err(|e| format!("failed to open {uri}: {e}"))
         }
-        JoinMethod::OpenSlots => Err("open_slots".into()),
     }
 }
 
@@ -23,25 +22,4 @@ pub fn notify_spot_available(friend_name: &str) {
         .appname("cs2-friendwatch")
         .timeout(10_000)
         .show();
-}
-
-/// Play a short system alert so the user notices even if the app is in the background.
-pub fn play_alert_sound() {
-    #[cfg(windows)]
-    {
-        std::thread::spawn(|| unsafe {
-            // Ascending beeps — distinct from a single generic ding.
-            windows_sys::Win32::System::Diagnostics::Debug::Beep(880, 180);
-            windows_sys::Win32::System::Diagnostics::Debug::Beep(1175, 220);
-            windows_sys::Win32::System::Diagnostics::Debug::Beep(1397, 280);
-        });
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = Notification::new()
-            .summary("CS2 Friendwatch")
-            .body("Spot available")
-            .appname("cs2-friendwatch")
-            .show();
-    }
 }

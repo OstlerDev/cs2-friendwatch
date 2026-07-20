@@ -1,5 +1,6 @@
 use crate::watcher::{
-    classify_presence, format_rich_detail, FriendPresence, WatchedFriendStatus, CS2_APP_ID,
+    classify_presence, format_rich_debug, format_rich_detail, FriendPresence, WatchedFriendStatus,
+    CS2_APP_ID,
 };
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -19,6 +20,8 @@ pub struct FriendInfo {
     pub name: String,
     pub presence: FriendPresence,
     pub detail: String,
+    /// Full rich-presence key dump for the debug panel.
+    pub rich_debug: String,
     /// Medium avatar RGBA (64×64×4), if available this poll.
     pub avatar_rgba: Option<Vec<u8>>,
 }
@@ -51,13 +54,6 @@ impl SteamSession {
         unsafe { sys::SteamAPI_SteamFriends_v018() }
     }
 
-    /// Open friend profile in the Steam overlay (fallback join path).
-    pub fn open_friend_overlay(&self, steam_id: u64) {
-        self.client
-            .friends()
-            .activate_game_overlay_to_user("steamid", SteamId::from_raw(steam_id));
-    }
-
     pub fn list_cs2_friends(&self) -> Vec<FriendInfo> {
         let friends_api = self.client.friends();
         let ptr = self.friends_ptr();
@@ -82,6 +78,7 @@ impl SteamSession {
                     name: f.name(),
                     presence: classify_presence(Some(app_id), lobby_opt, &keys),
                     detail: format_rich_detail(&keys),
+                    rich_debug: format_rich_debug(&keys),
                     avatar_rgba: f.medium_avatar(),
                 })
             })
@@ -119,6 +116,7 @@ impl SteamSession {
                     name,
                     presence,
                     detail: format_rich_detail(&keys),
+                    rich_debug: format_rich_debug(&keys),
                 }
             })
             .collect()

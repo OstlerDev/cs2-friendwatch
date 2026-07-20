@@ -11,16 +11,13 @@ pub enum JoinMethod {
     Lobby { lobby_id: u64 },
     /// CS2 rich-presence connect, e.g. `+gcconnect…`.
     Connect { connect: String },
-    /// Party/match reports open slots but no lobby id or connect string.
-    /// UI opens the friend's Steam overlay profile so Join Game is one click away.
-    OpenSlots,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FriendPresence {
     OfflineOrUnknown,
     OtherGame { app_id: u32 },
-    /// In CS2 but no join path / no free slot signal.
+    /// In CS2 but no Steam join path (lobby id / connect string).
     InCs2Full,
     Joinable { method: JoinMethod },
 }
@@ -32,9 +29,17 @@ pub struct WatchedFriendStatus {
     pub presence: FriendPresence,
     /// Map / score / mode line from rich presence when available.
     pub detail: String,
+    /// Full rich-presence key dump for debugging.
+    pub rich_debug: String,
 }
 
 /// Classify from Steamworks lobby id + CS2 rich-presence keys.
+///
+/// Only treat as joinable when Steam exposes a real join path:
+/// a lobby id, or a `connect` / `+gcconnect…` string.
+/// Party size keys (`members:numPlayers`, `steam_player_group_size`) are **not**
+/// join signals — Premier/comp often show open party seats while mid-match and
+/// Steam still hides Join Game.
 pub fn classify_presence(
     game_app_id: Option<u32>,
     lobby_id: Option<u64>,
@@ -65,41 +70,7 @@ pub fn classify_presence(
         };
     }
 
-    if has_free_slots(rich) {
-        return FriendPresence::Joinable {
-            method: JoinMethod::OpenSlots,
-        };
-    }
-
     FriendPresence::InCs2Full
-}
-
-/// CS2 sets `members:numPlayers` / `members:numSlots` (and sometimes party group size).
-pub fn has_free_slots(rich: &HashMap<String, String>) -> bool {
-    let players = parse_u32_key(rich, "members:numPlayers");
-    let slots = parse_u32_key(rich, "members:numSlots");
-    if let (Some(p), Some(s)) = (players, slots) {
-        if p < s {
-            return true;
-        }
-    }
-
-    // Premier/comp party: group size under typical max of 5 with a public party.
-    if let Some(size) = parse_u32_key(rich, "steam_player_group_size") {
-        let access = rich
-            .get("system:access")
-            .map(|s| s.eq_ignore_ascii_case("public"))
-            .unwrap_or(false);
-        if access && size < 5 {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn parse_u32_key(rich: &HashMap<String, String>, key: &str) -> Option<u32> {
-    rich.get(key)?.trim().parse().ok()
 }
 
 /// First friend in `order` that is currently joinable.
@@ -175,6 +146,17 @@ pub fn format_rich_detail(keys: &HashMap<String, String>) -> String {
     parts.join(" · ")
 }
 
+/// Sorted `key=value | …` dump for debug UI / logs.
+pub fn format_rich_debug(keys: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<_> = keys.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn pretty_map(raw: &str) -> String {
     let name = raw.rsplit('/').next().unwrap_or(raw);
     let name = name.strip_prefix("de_").unwrap_or(name);
@@ -214,7 +196,7 @@ pub fn format_elapsed(secs: u64) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyKey {
     pub steam_id: u64,
-    /// Distinguishes lobby id, connect token, or open-slots sentinel.
+    /// Distinguishes lobby id vs connect token.
     pub join_token: String,
 }
 
@@ -223,7 +205,6 @@ impl NotifyKey {
         let join_token = match method {
             JoinMethod::Lobby { lobby_id } => format!("lobby:{lobby_id}"),
             JoinMethod::Connect { connect } => format!("connect:{connect}"),
-            JoinMethod::OpenSlots => "openslots".into(),
         };
         Self {
             steam_id,
@@ -309,23 +290,20 @@ mod tests {
     }
 
     #[test]
-    fn free_member_slots_are_joinable() {
+    fn premier_open_party_slots_are_not_joinable() {
+        // Real-world Premier mid-match presence: party seats look free, Steam still
+        // hides Join Game (no lobby id, no connect, system:lock=mmqueue).
         let rich = keys(&[
+            ("game:map", "de_mirage"),
+            ("game:mode", "competitive"),
+            ("game:score", "[ 8 : 11 ]"),
             ("members:numPlayers", "4"),
             ("members:numSlots", "10"),
-            ("game:map", "de_mirage"),
+            ("steam_player_group_size", "4"),
+            ("system:access", "public"),
+            ("system:lock", "mmqueue"),
+            ("steam_display", "Premier - Mirage [ 8 : 11 ]"),
         ]);
-        assert_eq!(
-            classify_presence(Some(730), None, &rich),
-            FriendPresence::Joinable {
-                method: JoinMethod::OpenSlots
-            }
-        );
-    }
-
-    #[test]
-    fn full_slots_not_joinable() {
-        let rich = keys(&[("members:numPlayers", "10"), ("members:numSlots", "10")]);
         assert_eq!(
             classify_presence(Some(730), None, &rich),
             FriendPresence::InCs2Full
@@ -333,18 +311,16 @@ mod tests {
     }
 
     #[test]
-    fn public_party_under_five_is_joinable() {
+    fn member_slots_alone_not_joinable() {
         let rich = keys(&[
-            ("steam_player_group_size", "4"),
-            ("system:access", "public"),
+            ("members:numPlayers", "4"),
+            ("members:numSlots", "10"),
+            ("game:map", "de_mirage"),
         ]);
-        assert!(has_free_slots(&rich));
-        assert!(matches!(
+        assert_eq!(
             classify_presence(Some(730), None, &rich),
-            FriendPresence::Joinable {
-                method: JoinMethod::OpenSlots
-            }
-        ));
+            FriendPresence::InCs2Full
+        );
     }
 
     #[test]
@@ -371,9 +347,10 @@ mod tests {
                 steam_id: 2,
                 name: "B".into(),
                 presence: FriendPresence::Joinable {
-                    method: JoinMethod::OpenSlots,
+                    method: JoinMethod::Lobby { lobby_id: 1 },
                 },
                 detail: String::new(),
+                rich_debug: String::new(),
             },
             WatchedFriendStatus {
                 steam_id: 1,
@@ -384,6 +361,7 @@ mod tests {
                     },
                 },
                 detail: "Casual Nuke".into(),
+                rich_debug: String::new(),
             },
         ];
         let first = first_joinable(&[1, 2], &statuses).unwrap();

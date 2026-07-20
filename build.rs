@@ -1,3 +1,6 @@
+//! Bundle Steam redistributables into the binary and enable delay-load on MSVC
+//! so a single `.exe` can ship without a sidecar DLL.
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,56 +10,54 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    // OUT_DIR: target/<profile>/build/<crate>-<hash>/out → profile dir is nth(3)
-    let Some(profile_dir) = out_dir.ancestors().nth(3).map(Path::to_path_buf) else {
-        return;
-    };
-
-    copy_steam_api(&profile_dir);
-    copy_appid(&profile_dir);
-}
-
-fn copy_steam_api(profile_dir: &Path) {
     let lib_name = steam_api_lib_name();
-    let build_dir = profile_dir.join("build");
-    let Some(src) = find_in_build(&build_dir, "steamworks-sys-", lib_name) else {
-        println!(
-            "cargo:warning=could not find {lib_name} under {}; place it next to the .exe manually",
-            build_dir.display()
-        );
-        return;
-    };
-    let dst = profile_dir.join(lib_name);
-    if src != dst {
-        if let Err(e) = fs::copy(&src, &dst) {
-            println!(
-                "cargo:warning=failed to copy {} → {}: {e}",
-                src.display(),
-                dst.display()
-            );
-        }
-    }
-}
 
-fn copy_appid(profile_dir: &Path) {
+    let dll_src = find_steam_api_dll(lib_name).unwrap_or_else(|| {
+        panic!(
+            "could not find {lib_name} under target/*/build/steamworks-sys-*/out — \
+             build steamworks-sys first (cargo build)"
+        )
+    });
+
+    let dll_dst = out_dir.join(lib_name);
+    fs::copy(&dll_src, &dll_dst).unwrap_or_else(|e| {
+        panic!("failed to copy {} → {}: {e}", dll_src.display(), dll_dst.display())
+    });
+    println!("cargo:rerun-if-changed={}", dll_src.display());
+
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let src = manifest.join("steam_appid.txt");
-    if !src.exists() {
-        return;
+    let appid_src = manifest.join("steam_appid.txt");
+    fs::copy(&appid_src, out_dir.join("steam_appid.txt")).unwrap_or_else(|e| {
+        panic!("failed to copy steam_appid.txt: {e}")
+    });
+
+    // Delay-load so the process can start before the DLL is extracted at runtime.
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("windows") && target.contains("msvc") {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:{lib_name}");
+        println!("cargo:rustc-link-lib=delayimp");
     }
-    let dst = profile_dir.join("steam_appid.txt");
-    let _ = fs::copy(&src, &dst);
+
+    // Convenience for `cargo run`: also place redistributables next to the built exe.
+    if let Some(profile_dir) = out_dir.ancestors().nth(3).map(Path::to_path_buf) {
+        let _ = fs::copy(&dll_dst, profile_dir.join(lib_name));
+        let _ = fs::copy(&appid_src, profile_dir.join("steam_appid.txt"));
+    }
 }
 
-fn find_in_build(build_dir: &Path, prefix: &str, file_name: &str) -> Option<PathBuf> {
+fn find_steam_api_dll(lib_name: &str) -> Option<PathBuf> {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").ok()?);
+    // target/<profile>/build/<crate>/out → climb to target/<profile>
+    let profile_dir = out_dir.ancestors().nth(3)?;
+    let build_dir = profile_dir.join("build");
     let entries = fs::read_dir(build_dir).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with(prefix) {
+        if !name.starts_with("steamworks-sys-") {
             continue;
         }
-        let candidate = entry.path().join("out").join(file_name);
+        let candidate = entry.path().join("out").join(lib_name);
         if candidate.exists() {
             return Some(candidate);
         }
@@ -65,11 +66,14 @@ fn find_in_build(build_dir: &Path, prefix: &str, file_name: &str) -> Option<Path
 }
 
 fn steam_api_lib_name() -> &'static str {
-    if cfg!(all(windows, target_pointer_width = "64")) {
-        "steam_api64.dll"
-    } else if cfg!(windows) {
-        "steam_api.dll"
-    } else if cfg!(target_os = "macos") {
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("windows") {
+        if target.contains("i686") {
+            "steam_api.dll"
+        } else {
+            "steam_api64.dll"
+        }
+    } else if target.contains("darwin") || target.contains("apple") {
         "libsteam_api.dylib"
     } else {
         "libsteam_api.so"

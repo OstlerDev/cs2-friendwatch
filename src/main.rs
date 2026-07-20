@@ -1,27 +1,30 @@
+mod audio;
+mod bootstrap;
 mod config;
 mod notify;
 mod steam;
 mod watcher;
 
+use audio::{custom_sound_path, AlertPlayer};
 use config::Config;
 use eframe::egui::{
     self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Vec2,
 };
-use notify::{notify_spot_available, open_join, play_alert_sound};
+use notify::{notify_spot_available, open_join};
 use steam::{FriendInfo, SteamSession};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use watcher::{
     first_joinable, format_elapsed, FriendPresence, JoinMethod, NotifyDebouncer, NotifyKey,
     WatchedFriendStatus,
 };
 
-const POLL_INTERVAL: Duration = Duration::from_millis(1500);
-const IDLE_REFRESH: Duration = Duration::from_secs(15);
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(30);
 const ROW_HEIGHT: f32 = 58.0;
 const AVATAR_SIZE: f32 = 40.0;
+const JOIN_BTN_W: f32 = 64.0;
 
 const BG: Color32 = Color32::from_rgb(14, 16, 18);
 const PANEL: Color32 = Color32::from_rgb(22, 26, 30);
@@ -33,7 +36,14 @@ const AMBER: Color32 = Color32::from_rgb(222, 155, 53);
 const GREEN: Color32 = Color32::from_rgb(62, 168, 96);
 const RED: Color32 = Color32::from_rgb(200, 72, 72);
 
+/// CS2 accept-match neon green.
+const CS_GREEN: Color32 = Color32::from_rgb(90, 230, 110);
+
 fn main() -> eframe::Result<()> {
+    if let Err(e) = bootstrap::ensure_steam_runtime() {
+        eprintln!("cs2-friendwatch: failed to prepare Steam runtime: {e}");
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([620.0, 720.0])
@@ -78,6 +88,13 @@ struct FriendwatchApp {
     pending: Option<PendingJoin>,
     status_msg: String,
     filter: String,
+    show_settings: bool,
+    sound_volume: f32,
+    custom_sound_path: Option<String>,
+    show_rp_debug: bool,
+    active_poll_secs: f32,
+    idle_poll_secs: f32,
+    alert_player: AlertPlayer,
 }
 
 impl FriendwatchApp {
@@ -107,8 +124,14 @@ impl FriendwatchApp {
             Err(_) => Vec::new(),
         };
 
-        let watched_order: Vec<u64> = config.watched_steam_ids;
+        let watched_order: Vec<u64> = config.watched_steam_ids.clone();
         let watched_set: HashSet<u64> = watched_order.iter().copied().collect();
+        let sound_volume = config.sound_volume;
+        let custom_sound_path = config.custom_sound_path.clone();
+        let show_rp_debug = config.show_rp_debug;
+        let active_poll_secs = config.active_poll_secs;
+        let idle_poll_secs = config.idle_poll_secs;
+        let alert_player = AlertPlayer::new(sound_volume);
 
         let status_msg = match (&steam, steam_app_id) {
             (Ok(_), Some(730)) => format!(
@@ -144,14 +167,68 @@ impl FriendwatchApp {
             pending: None,
             status_msg,
             filter: String::new(),
+            show_settings: false,
+            sound_volume,
+            custom_sound_path,
+            show_rp_debug,
+            active_poll_secs,
+            idle_poll_secs,
+            alert_player,
         }
     }
 
-    fn persist_watch_list(&self) {
+    fn persist_config(&self) {
         let cfg = Config {
             watched_steam_ids: self.watched_order.clone(),
+            sound_volume: self.sound_volume,
+            custom_sound_path: self.custom_sound_path.clone(),
+            show_rp_debug: self.show_rp_debug,
+            active_poll_secs: self.active_poll_secs,
+            idle_poll_secs: self.idle_poll_secs,
         };
         let _ = cfg.save();
+    }
+
+    fn persist_watch_list(&self) {
+        self.persist_config();
+    }
+
+    fn sound_path_for_play(&self) -> Option<PathBuf> {
+        custom_sound_path(&self.custom_sound_path)
+    }
+
+    fn play_join_alert(&mut self) {
+        let path = self.sound_path_for_play();
+        self.alert_player.play(path.as_deref());
+    }
+
+    fn stop_join_alert(&mut self) {
+        self.alert_player.stop();
+    }
+
+    fn pending_still_valid(&self) -> bool {
+        let Some(pending) = &self.pending else {
+            return false;
+        };
+        self.statuses.iter().any(|s| {
+            s.steam_id == pending.steam_id
+                && matches!(
+                    &s.presence,
+                    FriendPresence::Joinable { method } if method == &pending.method
+                )
+        })
+    }
+
+    fn expire_pending(&mut self) {
+        self.pending = None;
+        self.alert_armed = false;
+        self.stop_join_alert();
+        self.debouncer.reset();
+        if self.watching {
+            self.status_msg = "Spot closed — still watching…".into();
+        } else {
+            self.status_msg = "Spot closed.".into();
+        }
     }
 
     fn toggle_watch(&mut self, steam_id: u64, name: &str, checked: bool) {
@@ -262,7 +339,11 @@ impl FriendwatchApp {
         self.prune_offline_from_watch_queue();
 
         if self.pending.is_some() {
-            return;
+            if !self.pending_still_valid() {
+                self.expire_pending();
+            } else {
+                return;
+            }
         }
 
         let joinable = first_joinable(&self.watched_order, &self.statuses).and_then(|s| {
@@ -285,9 +366,15 @@ impl FriendwatchApp {
         {
             let (name, detail, method) = joinable
                 .map(|(_, n, d, m)| (n, d, m))
-                .unwrap_or_else(|| ("Friend".into(), String::new(), JoinMethod::OpenSlots));
+                .unwrap_or_else(|| {
+                    (
+                        "Friend".into(),
+                        String::new(),
+                        JoinMethod::Lobby { lobby_id: 0 },
+                    )
+                });
             notify_spot_available(&name);
-            play_alert_sound();
+            self.play_join_alert();
             self.pending = Some(PendingJoin {
                 steam_id: key.steam_id,
                 name,
@@ -325,6 +412,7 @@ impl FriendwatchApp {
         self.needs_rewatch = true;
         self.pending = None;
         self.alert_armed = false;
+        self.stop_join_alert();
         self.status_msg = format!(
             "Joined via {name}. Watching stopped — click Start watching to look again."
         );
@@ -334,16 +422,10 @@ impl FriendwatchApp {
         let Some(p) = self.pending.take() else {
             return;
         };
+        self.alert_armed = false;
+        self.stop_join_alert();
         match open_join(&p.method, p.steam_id) {
-            Ok(()) => {
-                self.stop_watching_after_join(&p.name);
-            }
-            Err(e) if e == "open_slots" => {
-                if let Ok(session) = &self.steam {
-                    session.open_friend_overlay(p.steam_id);
-                }
-                self.stop_watching_after_join(&p.name);
-            }
+            Ok(()) => self.stop_watching_after_join(&p.name),
             Err(e) => {
                 self.status_msg = e;
                 self.pending = Some(p);
@@ -351,9 +433,21 @@ impl FriendwatchApp {
         }
     }
 
+    /// Join immediately from a friend row (bypasses the accept popup).
+    fn join_with_method(&mut self, steam_id: u64, name: &str, method: &JoinMethod) {
+        self.pending = None;
+        self.alert_armed = false;
+        self.stop_join_alert();
+        match open_join(method, steam_id) {
+            Ok(()) => self.stop_watching_after_join(name),
+            Err(e) => self.status_msg = e,
+        }
+    }
+
     fn dismiss_pending(&mut self) {
         self.pending = None;
         self.alert_armed = false;
+        self.stop_join_alert();
         if self.watching {
             self.status_msg = "Join dismissed — still watching.".into();
         } else {
@@ -387,6 +481,136 @@ impl FriendwatchApp {
             FriendPresence::Joinable { .. } => "Spot available".into(),
             FriendPresence::InCs2Full => "In CS2 — no open spot signal".into(),
             _ => "In CS2".into(),
+        }
+    }
+
+    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        let mut persist = false;
+        let mut test_sound = false;
+        let mut browse = false;
+        let mut clear_custom = false;
+
+        panel(ui, PANEL, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Settings")
+                        .color(TEXT)
+                        .size(15.0)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Close").clicked() {
+                        self.show_settings = false;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("Alert sound volume").color(MUTED).size(12.0));
+            let mut vol_pct = self.sound_volume * 100.0;
+            if ui
+                .add(egui::Slider::new(&mut vol_pct, 0.0..=100.0).suffix("%"))
+                .changed()
+            {
+                self.sound_volume = vol_pct / 100.0;
+                self.alert_player.set_volume(self.sound_volume);
+                persist = true;
+            }
+
+            ui.add_space(6.0);
+            ui.label(RichText::new("Custom alert sound").color(MUTED).size(12.0));
+            ui.horizontal(|ui| {
+                let label = self
+                    .custom_sound_path
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("Default (CS2 match found)");
+                ui.label(RichText::new(label).color(TEXT).size(12.0));
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Browse…").clicked() {
+                    browse = true;
+                }
+                if ui
+                    .add_enabled(
+                        self.custom_sound_path.is_some(),
+                        egui::Button::new("Use default"),
+                    )
+                    .clicked()
+                {
+                    clear_custom = true;
+                }
+                if ui.button("Test sound").clicked() {
+                    test_sound = true;
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("Active poll frequency").color(MUTED).size(12.0));
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.active_poll_secs, 1.0..=10.0)
+                        .suffix(" s")
+                        .fixed_decimals(1),
+                )
+                .changed()
+            {
+                persist = true;
+            }
+            ui.label(
+                RichText::new("While watching for a spot (or an alert is open).")
+                    .color(MUTED)
+                    .size(11.0),
+            );
+
+            ui.add_space(6.0);
+            ui.label(RichText::new("Idle poll frequency").color(MUTED).size(12.0));
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.idle_poll_secs, 5.0..=60.0)
+                        .suffix(" s")
+                        .fixed_decimals(0),
+                )
+                .changed()
+            {
+                persist = true;
+            }
+            ui.label(
+                RichText::new("Friend list refresh when not actively watching.")
+                    .color(MUTED)
+                    .size(11.0),
+            );
+
+            ui.add_space(8.0);
+            if ui
+                .checkbox(
+                    &mut self.show_rp_debug,
+                    "Show rich presence debug (for joinability reports)",
+                )
+                .changed()
+            {
+                persist = true;
+            }
+        });
+
+        if browse {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Audio", &["mp3", "wav", "ogg", "flac"])
+                .pick_file()
+            {
+                self.custom_sound_path = Some(path.display().to_string());
+                persist = true;
+            }
+        }
+        if clear_custom {
+            self.custom_sound_path = None;
+            persist = true;
+        }
+        if persist {
+            self.persist_config();
+        }
+        if test_sound {
+            self.play_join_alert();
         }
     }
 }
@@ -445,30 +669,37 @@ impl eframe::App for FriendwatchApp {
             session.run_callbacks();
         }
 
+        let idle = Duration::from_secs_f32(self.idle_poll_secs);
+        let active = Duration::from_secs_f32(self.active_poll_secs);
+
         let list_due = self
             .last_list_refresh
-            .map(|t| t.elapsed() >= IDLE_REFRESH)
+            .map(|t| t.elapsed() >= idle)
             .unwrap_or(true);
-        if self.steam.is_ok() && list_due && !self.watching {
+        if self.steam.is_ok() && list_due && !self.watching && self.pending.is_none() {
             self.refresh_cs2_list(ctx);
         }
 
-        if self.watching {
+        if self.watching || self.pending.is_some() {
             let due = self
                 .last_poll
-                .map(|t| t.elapsed() >= POLL_INTERVAL)
+                .map(|t| t.elapsed() >= active)
                 .unwrap_or(true);
             if due {
                 self.poll_once(ctx);
             }
-            ctx.request_repaint_after(Duration::from_millis(200));
-        } else if self.pending.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            // Keep painting while an alert is open (radar sweep).
+            let repaint = if self.pending.is_some() {
+                Duration::from_millis(33)
+            } else {
+                Duration::from_millis(200)
+            };
+            ctx.request_repaint_after(repaint);
         } else if self.steam.is_ok() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
 
-        // Always-on-top join alert window
+        // CS2-style always-on-top accept window
         let mut join_clicked = false;
         let mut dismiss_clicked = false;
         if let Some(pending) = self.pending.clone() {
@@ -478,55 +709,85 @@ impl eframe::App for FriendwatchApp {
             ctx.show_viewport_immediate(
                 alert_id,
                 egui::ViewportBuilder::default()
-                    .with_title("CS2 Friendwatch — Spot available!")
-                    .with_inner_size([440.0, 210.0])
+                    .with_title("YOUR MATCH IS READY!")
+                    .with_inner_size([460.0, 280.0])
                     .with_always_on_top()
                     .with_active(true)
                     .with_taskbar(true),
+               
+                    
                 |ctx, _class| {
-                    apply_theme(ctx);
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        dismiss_clicked = true;
+                    }
+
                     egui::CentralPanel::default()
-                        .frame(egui::Frame::NONE.fill(BG).inner_margin(20.0))
+                        .frame(egui::Frame::NONE.fill(Color32::from_rgb(8, 22, 12)).inner_margin(0.0))
                         .show(ctx, |ui| {
-                            ui.label(
-                                RichText::new("Spot available!")
-                                    .color(GREEN)
-                                    .size(22.0)
-                                    .strong(),
-                            );
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(&pending.name)
-                                    .color(TEXT)
-                                    .size(18.0)
-                                    .strong(),
-                            );
-                            if !pending.detail.is_empty() {
-                                ui.label(RichText::new(&pending.detail).color(MUTED).size(14.0));
-                            }
-                            ui.add_space(16.0);
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new("Join now").size(16.0).strong())
-                                            .fill(GREEN)
-                                            .min_size(Vec2::new(140.0, 36.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    join_clicked = true;
-                                }
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new("Dismiss").size(16.0))
-                                            .min_size(Vec2::new(100.0, 36.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    dismiss_clicked = true;
-                                }
+                            let full = ui.max_rect();
+                            paint_accept_match_backdrop(ui, full);
+
+                            ui.allocate_new_ui(
+                                egui::UiBuilder::new().max_rect(full.shrink(18.0)),
+                                |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new("YOUR MATCH IS READY!")
+                                            .color(CS_GREEN)
+                                            .size(22.0)
+                                            .strong(),
+                                    );
+                                    ui.add_space(6.0);
+                                    let rule_w = (ui.available_width() * 0.82).min(340.0);
+                                    let (rule_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(rule_w, 2.0),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rule_rect,
+                                        0.0,
+                                        CS_GREEN,
+                                    );
+                                    ui.add_space(14.0);
+
+                                    ui.label(
+                                        RichText::new(&pending.name)
+                                            .color(Color32::WHITE)
+                                            .size(17.0)
+                                            .strong(),
+                                    );
+                                    let detail = if pending.detail.is_empty() {
+                                        "Counter-Strike 2".to_string()
+                                    } else {
+                                        pending.detail.clone()
+                                    };
+                                    ui.label(
+                                        RichText::new(detail)
+                                            .color(Color32::from_rgb(210, 220, 210))
+                                            .size(14.0),
+                                    );
+
+                                    ui.add_space(22.0);
+                                    let accept = ui.add(
+                                        egui::Button::new(
+                                            RichText::new("ACCEPT")
+                                                .color(Color32::BLACK)
+                                                .size(20.0)
+                                                .strong(),
+                                        )
+                                        .fill(CS_GREEN)
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(2.0)
+                                        .min_size(Vec2::new(280.0, 48.0)),
+                                    );
+                                    if accept.clicked() {
+                                        join_clicked = true;
+                                    }
+                                });
                             });
                         });
+
                     if should_focus {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
@@ -565,6 +826,22 @@ impl eframe::App for FriendwatchApp {
                             .strong(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("⚙").size(16.0))
+                                    .fill(if self.show_settings {
+                                        PANEL_ALT
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .stroke(Stroke::new(1.0, BORDER)),
+                            )
+                            .on_hover_text("Settings")
+                            .clicked()
+                        {
+                            self.show_settings = !self.show_settings;
+                        }
+                        ui.add_space(6.0);
                         let (label, color) = match self.steam_app_id {
                             Some(730) => ("APP 730", GREEN),
                             Some(480) => ("APP 480", AMBER),
@@ -577,6 +854,11 @@ impl eframe::App for FriendwatchApp {
                 ui.add_space(2.0);
                 ui.label(RichText::new(&self.status_msg).color(MUTED).size(13.0));
                 ui.add_space(10.0);
+
+                if self.show_settings {
+                    self.draw_settings(ui);
+                    ui.add_space(10.0);
+                }
 
                 if self.steam.is_err() {
                     panel(ui, RED.linear_multiply(0.25), |ui| {
@@ -640,7 +922,10 @@ impl eframe::App for FriendwatchApp {
                                 );
                             } else if !self.watching {
                                 ui.label(
-                                    RichText::new("Idle refresh every 15s")
+                                    RichText::new(format!(
+                                        "Idle refresh every {:.0}s",
+                                        self.idle_poll_secs
+                                    ))
                                         .color(MUTED)
                                         .size(11.0),
                                 );
@@ -729,19 +1014,21 @@ impl eframe::App for FriendwatchApp {
                         }
 
                         let mut toggles: Vec<(u64, String, bool)> = Vec::new();
+                        let mut row_joins: Vec<(u64, String, JoinMethod)> = Vec::new();
                         for friend in &rows {
                             let checked = self.watched_set.contains(&friend.steam_id);
                             let (badge, badge_color) = Self::presence_badge(&friend.presence);
                             let detail = self.friend_detail_line(friend);
                             let avatar = self.avatar_tex.get(&friend.steam_id).cloned();
+                            let join_method = match &friend.presence {
+                                FriendPresence::Joinable { method } => Some(method.clone()),
+                                _ => None,
+                            };
 
                             let width = ui.available_width();
                             let (rect, response) =
                                 ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
                             let hovered = response.hovered();
-                            if response.clicked() {
-                                toggles.push((friend.steam_id, friend.name.clone(), !checked));
-                            }
 
                             let fill = if checked {
                                 Color32::from_rgb(32, 38, 28)
@@ -841,9 +1128,56 @@ impl eframe::App for FriendwatchApp {
                                 FontId::proportional(12.0),
                                 MUTED,
                             );
+
+                            let mut join_clicked = false;
+                            if let Some(method) = &join_method {
+                                let btn_rect = Rect::from_center_size(
+                                    Pos2::new(
+                                        rect.right() - 12.0 - JOIN_BTN_W / 2.0,
+                                        rect.center().y,
+                                    ),
+                                    Vec2::new(JOIN_BTN_W, 28.0),
+                                );
+                                let btn_id = ui.id().with(("row_join", friend.steam_id));
+                                let btn_resp = ui.interact(btn_rect, btn_id, Sense::click());
+                                let btn_fill = if btn_resp.hovered() {
+                                    Color32::from_rgb(110, 245, 130)
+                                } else {
+                                    CS_GREEN
+                                };
+                                ui.painter().rect(
+                                    btn_rect,
+                                    3.0,
+                                    btn_fill,
+                                    Stroke::NONE,
+                                    StrokeKind::Inside,
+                                );
+                                ui.painter().text(
+                                    btn_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Join",
+                                    FontId::proportional(13.0),
+                                    Color32::BLACK,
+                                );
+                                if btn_resp.clicked() {
+                                    join_clicked = true;
+                                    row_joins.push((
+                                        friend.steam_id,
+                                        friend.name.clone(),
+                                        method.clone(),
+                                    ));
+                                }
+                            }
+
+                            if response.clicked() && !join_clicked {
+                                toggles.push((friend.steam_id, friend.name.clone(), !checked));
+                            }
                         }
                         for (id, name, checked) in toggles {
                             self.toggle_watch(id, &name, checked);
+                        }
+                        for (id, name, method) in row_joins {
+                            self.join_with_method(id, &name, &method);
                         }
                     });
 
@@ -894,6 +1228,39 @@ impl eframe::App for FriendwatchApp {
                         });
                     }
                 }
+
+                if self.show_rp_debug && !self.cs2_friends.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Rich presence debug")
+                            .color(AMBER)
+                            .size(13.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new("Copy these lines if a joinable/false-positive report is needed.")
+                            .color(MUTED)
+                            .size(11.0),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("rp_debug")
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for f in &self.cs2_friends {
+                                let dump = if f.rich_debug.is_empty() {
+                                    "(no rich presence keys yet)".to_string()
+                                } else {
+                                    f.rich_debug.clone()
+                                };
+                                ui.label(
+                                    RichText::new(format!("{}: {}", f.name, dump))
+                                        .color(MUTED)
+                                        .monospace()
+                                        .size(11.0),
+                                );
+                            }
+                        });
+                }
             });
     }
 }
@@ -905,6 +1272,33 @@ fn presence_fallback(p: &FriendPresence) -> &'static str {
         FriendPresence::OtherGame { .. } => "Other game",
         FriendPresence::OfflineOrUnknown => "Offline / unknown",
     }
+}
+
+/// CS2 accept-match backdrop: green border, full tinted fill, single radar sweep bar.
+fn paint_accept_match_backdrop(ui: &mut egui::Ui, rect: Rect) {
+    let painter = ui.painter();
+    // Full-panel green-tinted black (not a left-only haze).
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(8, 22, 12));
+    painter.rect_stroke(rect, 0.0, Stroke::new(3.0, CS_GREEN), StrokeKind::Inside);
+
+    let t = ui.input(|i| i.time);
+    let period = 3.2_f64;
+    let phase = ((t % period) / period) as f32;
+    let bar_w = 4.0;
+    let x = rect.left() + phase * (rect.width() + bar_w) - bar_w;
+
+    // Soft trail behind the leading edge, then a single bright bar.
+    let trail = Rect::from_min_size(
+        Pos2::new(x - 18.0, rect.top()),
+        Vec2::new(18.0, rect.height()),
+    );
+    painter.rect_filled(
+        trail,
+        0.0,
+        Color32::from_rgba_unmultiplied(70, 200, 90, 28),
+    );
+    let bar = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(bar_w, rect.height()));
+    painter.rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(110, 255, 130, 140));
 }
 
 fn panel(ui: &mut egui::Ui, fill: Color32, add_contents: impl FnOnce(&mut egui::Ui)) {
