@@ -6,9 +6,8 @@ You still choose when to join — Friendwatch never auto-joins for you.
 
 ## Download
 
-1. Open the [**Releases**](releases) page on GitHub.
-2. Grab the latest `cs2-friendwatch-…-windows-x64.exe`.
-3. Put it anywhere you like and run it.
+1. [Download the latest `cs2-friendwatch.exe` from the Releases page.](https://github.com/OstlerDev/cs2-friendwatch/releases/latest/download/cs2-friendwatch.exe)
+2. Put it anywhere you like and run it.
 
 That’s the whole install. No installer, no extra DLLs next to the exe.
 

@@ -28,9 +28,9 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/cs2-friendwatch.exe \
-            "dist/cs2-friendwatch-${GITHUB_REF_NAME}-windows-x64.exe"
+            "dist/cs2-friendwatch.exe"
 
       - name: Attach exe to release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/cs2-friendwatch-*-windows-x64.exe
+          files: dist/cs2-friendwatch.exe
